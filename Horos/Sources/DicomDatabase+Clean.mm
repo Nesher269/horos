@@ -46,6 +46,8 @@
 #import "Notifications.h"
 #import "NSThread+N2.h"
 #import "PreferencesWindowController.h"
+#import "QueryController.h"
+#import "DCMTKStudyQueryNode.h"
 
 #define MAXSTUDYDELETE 50
 
@@ -360,7 +362,17 @@ static BOOL _showingCleanForFreeSpaceWarning = NO;
 -(void)cleanForFreeSpace {
 	if (self.isReadOnly)
         return;
-    
+
+    // Database size cap (AUTOCLEANINGDATABASESIZE, MB): replaces the free-disk-space rule.
+    // Runs in the background, so imports never wait on the PACS check.
+    if ([NSUserDefaults.standardUserDefaults integerForKey:@"AUTOCLEANINGDATABASESIZE"] > 0) {
+        if (self.isLocal)
+            [(self.isMainDatabase ? self : (DicomDatabase*)self.mainDatabase) _initiateCleanForDatabaseSize];
+        if ([self isFileSystemFreeSizeLimitReached])
+            [self performSelectorOnMainThread:@selector(_cleanForFreeSpaceWarning) withObject:nil waitUntilDone:NO];
+        return;
+    }
+
     [_cleanLock lock];
     
     NSThread* thread = [NSThread currentThread];
@@ -640,6 +652,257 @@ static BOOL _cleanForFreeSpaceLimitSoonReachedDisplayed = NO;
         [thread exitOperation];
         [_cleanLock unlock];
     }
+}
+
+#pragma mark - Database size cap
+
+// Keeps the local database under AUTOCLEANINGDATABASESIZE megabytes, whatever the free space
+// left on the disk. The least recently imported studies go first (dateAdded, refreshed when a
+// study is imported or retrieved again). A study is deleted only if the DICOM node named by
+// AUTOCLEANINGDATABASESIZEPACS answers that it holds at least as many instances; if that node
+// is unreachable, nothing is deleted. Always kept: locked studies, studies in an album,
+// studies imported less than 30 min ago (import in progress) or opened less than 12 h ago.
+
+static BOOL _cleanForDatabaseSizeRunning = NO;
+static NSMutableSet* _cleanForDatabaseSizeWarnedStudies = nil;
+
+-(void)_initiateCleanForDatabaseSize {
+    @synchronized ([DicomDatabase class]) {
+        if (_cleanForDatabaseSizeRunning)
+            return;
+        _cleanForDatabaseSizeRunning = YES;
+    }
+    [self performSelectorInBackground:@selector(_cleanForDatabaseSizeThread) withObject:nil];
+}
+
+-(void)_cleanForDatabaseSizeThread {
+    NSAutoreleasePool* pool = [NSAutoreleasePool new];
+    @try {
+        [NSThread currentThread].name = NSLocalizedString(@"Cleaning...", nil);
+        NSInteger maxMB = [NSUserDefaults.standardUserDefaults integerForKey:@"AUTOCLEANINGDATABASESIZE"];
+        if (maxMB > 0)
+            [self.independentDatabase cleanForDatabaseSizeMB:maxMB];
+    } @catch (NSException* e) {
+        N2LogExceptionWithStackTrace(e);
+    } @finally {
+        @synchronized ([DicomDatabase class]) {
+            _cleanForDatabaseSizeRunning = NO;
+        }
+        [pool release];
+    }
+}
+
+-(unsigned long long)_cleanDatabaseSizeBytes {
+    unsigned long long total = 0;
+    NSURL* url = [NSURL fileURLWithPath:self.dataDirPath isDirectory:YES];
+    NSArray* keys = [NSArray arrayWithObjects:NSURLIsRegularFileKey, NSURLTotalFileAllocatedSizeKey, nil];
+    NSDirectoryEnumerator* e = [NSFileManager.defaultManager enumeratorAtURL:url includingPropertiesForKeys:keys options:0 errorHandler:nil];
+    for (NSURL* f in e) {
+        @autoreleasepool {
+            NSNumber* isFile = nil;
+            NSNumber* size = nil;
+            [f getResourceValue:&isFile forKey:NSURLIsRegularFileKey error:NULL];
+            if (![isFile boolValue])
+                continue;
+            [f getResourceValue:&size forKey:NSURLTotalFileAllocatedSizeKey error:NULL];
+            total += [size unsignedLongLongValue];
+        }
+    }
+    return total;
+}
+
+// Files of the study stored in the database folder (frames of a multi-frame image share one
+// file), and how many DICOM instances the PACS should hold for it: Horos' own ROI, report,
+// annotation and "no autodeletion" series are never sent, so they are not counted.
+-(NSSet*)_cleanLocalPathsOfStudy:(DicomStudy*)study instances:(NSUInteger*)instances {
+    NSString* dir = self.dataBaseDirPath;
+    if (![dir hasSuffix:@"/"])
+        dir = [dir stringByAppendingString:@"/"];
+    
+    NSMutableSet* localPaths = [NSMutableSet set];
+    NSMutableSet* dicomPaths = [NSMutableSet set];
+    for (DicomSeries* series in study.series) {
+        int seriesID = series.id.intValue;
+        BOOL internal = (seriesID >= 5002 && seriesID <= 5005 && [series.name hasPrefix:@"OsiriX "]);
+        for (DicomImage* image in series.images) {
+            NSString* path = image.completePath;
+            if (path == nil)
+                continue;
+            if ([path hasPrefix:dir])
+                [localPaths addObject:path];
+            if (!internal)
+                [dicomPaths addObject:path];
+        }
+    }
+    if (instances)
+        *instances = dicomPaths.count;
+    return localPaths;
+}
+
+-(NSDictionary*)_cleanPACSServer {
+    NSString* name = [NSUserDefaults.standardUserDefaults stringForKey:@"AUTOCLEANINGDATABASESIZEPACS"];
+    if (name.length == 0)
+        return nil;
+    for (NSDictionary* server in [NSUserDefaults.standardUserDefaults arrayForKey:@"SERVERS"])
+        if ([server isKindOfClass:[NSDictionary class]] && [[server objectForKey:@"Description"] isEqualToString:name])
+            return server;
+    return nil;
+}
+
+-(void)_cleanForDatabaseSizeNotOnPACSWarning:(NSArray*)studies {
+    if ([NSUserDefaults.standardUserDefaults boolForKey:@"hideListenerError"])
+        return;
+    NSAlert* alert = [[NSAlert new] autorelease];
+    [alert setMessageText:@"Nettoyage de la base : \u00e9tudes conserv\u00e9es"];
+    [alert setInformativeText:[NSString stringWithFormat:@"La base d\u00e9passe sa taille maximale, mais ces \u00e9tudes n'ont pas \u00e9t\u00e9 effac\u00e9es parce que le PACS ne les a pas en entier :\n\n%@\n\nRenvoyez-les au PACS, ou verrouillez-les (cadenas) pour les garder.", [studies componentsJoinedByString:@"\n"]]];
+    [alert addButtonWithTitle:@"OK"];
+    [alert runModal];
+}
+
+-(void)cleanForDatabaseSizeMB:(NSInteger)maxMB {
+    if (self.isReadOnly || !self.isLocal || maxMB <= 0)
+        return;
+    
+    unsigned long long limit = (unsigned long long)maxMB * 1024 * 1024;
+    unsigned long long size = [self _cleanDatabaseSizeBytes];
+    if (size <= limit)
+        return;
+    
+    NSLog(@"Info: database size cap: %llu MB used, %ld MB allowed", size/1024/1024, (long)maxMB);
+    
+    NSDictionary* pacs = [self _cleanPACSServer];
+    if (pacs == nil) {
+        NSLog(@"Warning: database size cap: no DICOM node named \"%@\", nothing deleted", [NSUserDefaults.standardUserDefaults stringForKey:@"AUTOCLEANINGDATABASESIZEPACS"]);
+        return;
+    }
+    if (![QueryController echoServer:pacs]) {
+        NSLog(@"Info: database size cap: %@ unreachable, nothing deleted", [pacs objectForKey:@"Description"]);
+        return;
+    }
+    
+    [_cleanLock lock];
+    
+    NSThread* thread = [NSThread currentThread];
+    [thread enterOperation];
+    thread.status = NSLocalizedString(@"Cleaning database...", nil);
+    
+    NSMutableArray* notOnPACS = [NSMutableArray array];
+    int deletedStudies = 0;
+    
+    @try {
+        BOOL flagDoNotDeleteIfComments = [NSUserDefaults.standardUserDefaults boolForKey:@"dontDeleteStudiesWithComments"];
+        NSDate* now = [NSDate date];
+        NSTimeInterval minAge = 30*60; // AUTOCLEANINGDATABASESIZEMINAGE (minutes) only exists for testing
+        if ([NSUserDefaults.standardUserDefaults objectForKey:@"AUTOCLEANINGDATABASESIZEMINAGE"])
+            minAge = [NSUserDefaults.standardUserDefaults integerForKey:@"AUTOCLEANINGDATABASESIZEMINAGE"] * 60;
+        
+        NSMutableArray* candidates = [NSMutableArray array];
+        for (DicomStudy* study in [self objectsForEntity:self.studyEntity]) {
+            if ([study.lockedStudy boolValue])
+                continue;
+            if (study.albums.count > 0)
+                continue;
+            if (flagDoNotDeleteIfComments && (study.comment.length || study.comment2.length || study.comment3.length || study.comment4.length))
+                continue;
+            NSDate* added = study.dateAdded ? study.dateAdded : study.date;
+            if (added == nil || [now timeIntervalSinceDate:added] < minAge) // import in progress
+                continue;
+            if (study.dateOpened && [now timeIntervalSinceDate:study.dateOpened] < 12*60*60) // probably on screen
+                continue;
+            [candidates addObject:study];
+        }
+        
+        [candidates sortUsingComparator:^NSComparisonResult(DicomStudy* a, DicomStudy* b) {
+            NSDate* da = a.dateAdded ? a.dateAdded : a.date;
+            NSDate* db = b.dateAdded ? b.dateAdded : b.date;
+            return [da compare:db];
+        }];
+        
+        @synchronized ([DicomDatabase class]) {
+            if (_cleanForDatabaseSizeWarnedStudies == nil)
+                _cleanForDatabaseSizeWarnedStudies = [[NSMutableSet alloc] init];
+        }
+        
+        for (DicomStudy* study in candidates) {
+            if (size <= limit || deletedStudies >= MAXSTUDYDELETE)
+                break;
+            
+            @autoreleasepool {
+                NSUInteger instances = 0;
+                NSSet* paths = [self _cleanLocalPathsOfStudy:study instances:&instances];
+                NSString* uid = study.studyInstanceUID;
+                if (uid.length == 0 || instances == 0)
+                    continue;
+                
+                BOOL found = NO;
+                NSUInteger onPACS = 0;
+                for (id node in [QueryController queryStudyInstanceUID:uid server:pacs showErrors:NO]) {
+                    if ([node isKindOfClass:[DCMTKStudyQueryNode class]] && [[node uid] isEqualToString:uid]) {
+                        found = YES;
+                        onPACS = [[node numberImages] unsignedIntegerValue];
+                    }
+                }
+                
+                if (!found || onPACS < instances) {
+                    NSLog(@"Warning: database size cap: study %@ has %lu of %lu instances on %@, kept", uid, (unsigned long)onPACS, (unsigned long)instances, [pacs objectForKey:@"Description"]);
+                    @synchronized ([DicomDatabase class]) {
+                        if (![_cleanForDatabaseSizeWarnedStudies containsObject:uid]) {
+                            [_cleanForDatabaseSizeWarnedStudies addObject:uid];
+                            [notOnPACS addObject:[NSString stringWithFormat:@"%@, %@ (%lu/%lu images)", study.name, study.studyName ? study.studyName : @"", (unsigned long)onPACS, (unsigned long)instances]];
+                        }
+                    }
+                    continue;
+                }
+                
+                unsigned long long freed = 0;
+                for (NSString* path in paths) {
+                    freed += [[NSFileManager.defaultManager attributesOfItemAtPath:path error:NULL] fileSize];
+                    unlink(path.fileSystemRepresentation);
+                    if ([path.pathExtension isEqualToString:@"hdr"]) // ANALYZE -> DELETE IMG
+                        [NSFileManager.defaultManager removeItemAtPath:[path.stringByDeletingPathExtension stringByAppendingPathExtension:@"img"] error:NULL];
+                }
+                
+                NSLog(@"Info: study %@ deleted for the database size cap (added %@, %lu instances on %@)", uid, study.dateAdded, (unsigned long)onPACS, [pacs objectForKey:@"Description"]);
+                
+                for (DicomSeries* series in [[study series] allObjects]) {
+                    @try {
+                        for (DicomImage* image in series.images.allObjects)
+                            @try {
+                                [self.managedObjectContext deleteObject:image];
+                            } @catch (...) { }
+                    } @catch (...) { }
+                    @try {
+                        [self.managedObjectContext deleteObject:series];
+                    } @catch (...) { }
+                }
+                @try {
+                    [self.managedObjectContext deleteObject:study];
+                } @catch (...) { }
+                
+                size = (freed < size) ? size - freed : 0;
+                deletedStudies++;
+            }
+        }
+        
+        [self save:nil];
+        
+        if (deletedStudies > 0) {
+            [NSNotificationCenter.defaultCenter postNotificationName:_O2AddToDBAnywayNotification object:self userInfo:nil];
+            [NSNotificationCenter.defaultCenter postNotificationName:_O2AddToDBAnywayCompleteNotification object:self userInfo:nil];
+            [NSNotificationCenter.defaultCenter postNotificationName:OsirixAddToDBNotification object:self userInfo:nil];
+            [NSNotificationCenter.defaultCenter postNotificationName:OsirixAddToDBCompleteNotification object:self userInfo:nil];
+        }
+        
+        NSLog(@"Info: database size cap: %d studies deleted, about %llu MB used", deletedStudies, size/1024/1024);
+    } @catch (NSException* e) {
+        N2LogExceptionWithStackTrace(e);
+    } @finally {
+        [thread exitOperation];
+        [_cleanLock unlock];
+    }
+    
+    if (notOnPACS.count > 0)
+        [self performSelectorOnMainThread:@selector(_cleanForDatabaseSizeNotOnPACSWarning:) withObject:notOnPACS waitUntilDone:NO];
 }
 
 @end

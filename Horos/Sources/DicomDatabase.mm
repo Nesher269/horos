@@ -2153,6 +2153,10 @@ static BOOL protectionAgainstReentry = NO;
                                         }
                                         
                                         newObject = NO;
+                                        
+                                        // Imported or retrieved again: the study counts as recent for the database size cap
+                                        if (study)
+                                            study.dateAdded = today;
                                     }
                                     else
                                     {

@@ -49,5 +49,6 @@
 -(void)cleanOldStuff;
 -(void)cleanForFreeSpace;
 -(void)cleanForFreeSpaceMB:(NSInteger)freeMemoryRequested; // so we can allow timed "deep clean"
+-(void)cleanForDatabaseSizeMB:(NSInteger)maxMB; // AUTOCLEANINGDATABASESIZE: cap on the database's own size
 
 @end
